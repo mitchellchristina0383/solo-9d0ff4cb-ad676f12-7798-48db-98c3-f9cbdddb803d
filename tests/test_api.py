@@ -84,3 +84,53 @@ def test_plan_api_rejects_bad_input(client, payload):
 
     resp = client.post("/api/plan", json={"replicas": [], "batches": []})
     assert resp.status_code == 400
+
+
+def test_plan_api_without_budget_keeps_full_verification(client, payload):
+    data = client.post("/api/plan", json=payload).get_json()
+    assert data["verify_budget"] is None
+    assert data["verify_calls"] > 0
+    assert data["pending_cells"] == 0
+    assert data["shortest_confirmed"] is True
+    # 矩阵三态字段齐全且无未验格
+    for row in data["matrix"]:
+        for batch_cells in row:
+            for cell in batch_cells.values():
+                assert cell["state"] in {"pass", "fail"}
+
+
+def test_plan_api_budget_pending_response(client, payload):
+    payload["verify_budget"] = 4
+    resp = client.post("/api/plan", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] and data["status"] == "pending"
+    assert data["verify_calls"] == 4
+    assert data["verify_budget"] == 4
+    assert data["pending_cells"] > 0
+    assert data["shortest_confirmed"] is False
+
+
+def test_plan_api_budget_plan_unconfirmed_response(client, payload):
+    payload["verify_budget"] = 48
+    data = client.post("/api/plan", json=payload).get_json()
+    assert data["status"] == "plan_unconfirmed"
+    assert data["verify_calls"] <= 48
+    assert data["pending_cells"] > 0
+    assert data["shortest_confirmed"] is False
+    # 方案内每步核验全部通过
+    for step in data["plan"]:
+        assert step["checks_passed"] == step["checks_total"]
+
+
+def test_plan_api_rejects_bad_budget(client, payload):
+    payload["verify_budget"] = 0
+    assert client.post("/api/plan", json=payload).status_code == 400
+    payload["verify_budget"] = "abc"
+    assert client.post("/api/plan", json=payload).status_code == 400
+    payload["verify_budget"] = True  # 布尔值不得被当作整数 1
+    assert client.post("/api/plan", json=payload).status_code == 400
+    # 空字符串等价于不启用上限，正常求解
+    payload["verify_budget"] = ""
+    ok_resp = client.post("/api/plan", json=payload).get_json()
+    assert ok_resp["ok"] and ok_resp["verify_budget"] is None

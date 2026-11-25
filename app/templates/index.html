@@ -40,6 +40,19 @@
       <input type="number" id="maxTransition" min="0" max="4" step="1" value="3">
       <span class="hint">0 表示不允许并集过渡，只能直接更换根包。</span>
     </div>
+    <div class="limit-row budget-row">
+      <label class="budget-enable">
+        <input type="checkbox" id="budgetEnabled">
+        启用 OpenSSL 调用上限
+      </label>
+      <label for="verifyBudget">本次请求最多调用 openssl 次数：</label>
+      <input type="number" id="verifyBudget" min="1" step="1" value="30" disabled>
+      <span class="hint">
+        启用后每个“批次×副本”核验格最多调用一次（按请求开始时刻核验并缓存）；
+        能确定最短方案、最小过渡名额或确认无解时即提前停验，调用次数用尽且
+        未验格仍可能改判时标记“待核”。
+      </span>
+    </div>
     <div class="actions">
       <button type="button" class="btn primary" id="solveBtn">求解变更顺序</button>
       <span id="formError" class="error"></span>
@@ -184,11 +197,15 @@ function collect() {
     fields.forEach(f => { row[f] = node.querySelector('.' + f).value; });
     return row;
   });
-  return {
+  const payload = {
     replicas: rows(replicasEl, ['old_chain', 'new_chain']),
     batches: rows(batchesEl, ['old_bundle', 'new_bundle']),
     max_transition: parseInt(document.getElementById('maxTransition').value, 10)
   };
+  if (document.getElementById('budgetEnabled').checked) {
+    payload.verify_budget = parseInt(document.getElementById('verifyBudget').value, 10);
+  }
+  return payload;
 }
 
 function esc(s) {
@@ -233,13 +250,35 @@ function renderMatrix(matrix, replicaNames, batchNames) {
     + row.map((cells, j) => `<td title="${esc(batchNames[j])}">`
       + combos.map(([cs, bm]) => {
           const c = cells[`${cs}-${bm}`];
-          return `<span class="cell ${c.ok ? 'ok' : 'bad'}">${c.ok ? '✓' : '✗'}</span>`;
+          const state = c.state || (c.ok ? 'pass' : 'fail');
+          const mark = state === 'pass' ? '✓' : state === 'fail' ? '✗' : '？';
+          const title = state === 'pending' ? '未验：调用次数已达上限'
+            : (state === 'pass' ? '核验通过' : '核验失败：' + (c.reason || ''));
+          return `<span class="cell ${state}" title="${esc(title)}">${mark}</span>`;
         }).join('')
       + '</td>').join('') + '</tr>').join('');
   return `<h3>核验矩阵（行=副本，列=链 × 根包组合；每格内顺序对应表头）</h3>
   <div class="matrix-scroll"><table class="matrix">
     <thead><tr><th></th>${head}</tr></thead><tbody>${rows}</tbody></table></div>
-  <p class="hint">✗ 可在上方明细表中查看 openssl 给出的具体原因。</p>`;
+  <p class="hint">
+    <span class="cell pass">✓</span> 核验通过；
+    <span class="cell fail">✗</span> 核验失败（原因见上方明细表）；
+    <span class="cell pending">？</span> 未验（openssl 调用次数已达上限，结论可能改判）。
+  </p>`;
+}
+
+function renderBudgetBar(data) {
+  if (data.verify_budget === null || data.verify_budget === undefined) {
+    return `<div class="budget-bar unlimited">本次未启用调用上限：实际调用 openssl
+      <strong>${data.verify_calls ?? 0}</strong> 次，全部核验格均已验完。</div>`;
+  }
+  const exhausted = data.verify_calls >= data.verify_budget;
+  return `<div class="budget-bar ${exhausted ? 'exhausted' : 'within'}">
+    OpenSSL 调用上限 <strong>${data.verify_budget}</strong> 次，实际调用
+    <strong>${data.verify_calls}</strong> 次${exhausted ? '（已用尽）' : ''}；
+    未验核验格 <strong>${data.pending_cells ?? 0}</strong> 个。
+    每格整次请求最多调用一次，所有结论均按请求开始时刻的材料快照作出。
+  </div>`;
 }
 
 function renderPlan(data) {
@@ -250,7 +289,10 @@ function renderPlan(data) {
       ｜ 终端根包 [${s.bundles_label.map(esc).join('，')}]</div>
     <div class="step-checks">本步核验 ${s.checks_passed}/${s.checks_total} 个“批次×副本”组合全部通过</div>
   </li>`).join('');
-  return `<div class="banner ok"><strong>${esc(data.message)}</strong></div>
+  const bannerClass = data.shortest_confirmed === false ? 'warn' : 'ok';
+  const tbd = data.shortest_confirmed === false
+    ? '<div class="tag warn-tag">最短步数待定：调用次数已用尽，未验格可能存在更短方案</div>' : '';
+  return `<div class="banner ${bannerClass}"><strong>${esc(data.message)}</strong>${tbd}</div>
   <ol class="plan">${steps}</ol>`;
 }
 
@@ -274,12 +316,18 @@ document.getElementById('solveBtn').addEventListener('click', async () => {
       body.innerHTML = `<div class="banner bad"><strong>输入有误：</strong>${esc(data.error)}</div>`;
       return;
     }
-    let html = '';
-    if (data.status === 'plan') {
+    let html = renderBudgetBar(data);
+    if (data.status === 'plan' || data.status === 'plan_unconfirmed') {
       html += renderPlan(data);
     } else if (data.status === 'insufficient_quota') {
       html += `<div class="banner warn"><strong>无解（过渡名额不足）。</strong>${esc(data.message)}<br>
         请把“同时过渡批次上限”调大到至少 <strong>${data.min_required}</strong> 后重新求解。</div>`;
+    } else if (data.status === 'pending') {
+      const quotaHint = data.min_required !== null && data.min_required !== undefined
+        ? `<br>已核验出的过渡名额下界：至少 <strong>${data.min_required}</strong>
+           个批次同时过渡（精确最小值待定）。` : '';
+      html += `<div class="banner warn"><strong>结论待定（待核）。</strong>${esc(data.message)}${quotaHint}<br>
+        请调大“openssl 调用上限”后重新求解；下方矩阵中 <span class="cell pending">？</span> 为未验格。</div>`;
     } else {
       html += `<div class="banner bad"><strong>无解（证书材料无法通过验证）。</strong>${esc(data.message)}</div>`;
       html += renderViolationTable(data.initial_violations, '现状核验失败项（旧证书链 × 旧根包）');
@@ -298,6 +346,12 @@ document.getElementById('solveBtn').addEventListener('click', async () => {
 addEntity('replica');
 addEntity('batch');
 if (SAMPLE) document.getElementById('loadSample').click();
+
+const budgetEnabledEl = document.getElementById('budgetEnabled');
+const verifyBudgetEl = document.getElementById('verifyBudget');
+budgetEnabledEl.addEventListener('change', () => {
+  verifyBudgetEl.disabled = !budgetEnabledEl.checked;
+});
 </script>
 </body>
 </html>

@@ -66,6 +66,25 @@ def create_app() -> Flask:
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "同时过渡批次上限须为整数"}), 400
 
+        # 可选的 openssl 调用上限：缺省/None/空串表示不启用
+        verify_budget: int | None = None
+        raw_budget = payload.get("verify_budget")
+        if raw_budget is not None and str(raw_budget).strip() != "":
+            if isinstance(raw_budget, bool):
+                return jsonify(
+                    {"ok": False, "error": "openssl 调用上限须为整数或留空"}
+                ), 400
+            try:
+                verify_budget = int(raw_budget)
+            except (TypeError, ValueError):
+                return jsonify(
+                    {"ok": False, "error": "openssl 调用上限须为整数或留空"}
+                ), 400
+            if verify_budget < 1:
+                return jsonify(
+                    {"ok": False, "error": "openssl 调用上限须不小于 1"}
+                ), 400
+
         try:
             replica_rows = _collect_rows(
                 payload.get("replicas", []), ("old_chain", "new_chain")
@@ -87,7 +106,9 @@ def create_app() -> Flask:
                     {"ok": False, "error": "副本与终端批次均最多 4 个"}
                 ), 400
 
-            planner = build_planner(replica_rows, batch_rows, max_transition)
+            planner = build_planner(
+                replica_rows, batch_rows, max_transition, verify_budget
+            )
             result = planner.solve()
         except PemError as exc:
             return jsonify({"ok": False, "error": f"PEM 解析失败: {exc}"}), 400
@@ -106,6 +127,10 @@ def create_app() -> Flask:
                 "initial_violations": result.initial_violations,
                 "target_violations": result.target_violations,
                 "blocker_pairs": result.blocker_pairs,
+                "verify_budget": result.verify_budget,
+                "verify_calls": result.verify_calls,
+                "pending_cells": result.pending_cells,
+                "shortest_confirmed": result.shortest_confirmed,
                 "replica_names": [r.name for r in planner.replicas],
                 "batch_names": [b.name for b in planner.batches],
                 "state_labels": STATE_LABEL,

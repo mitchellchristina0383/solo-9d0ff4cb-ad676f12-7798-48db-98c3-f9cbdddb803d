@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import pathlib
 
 import pytest
 
 from app.certutil import extract_certs, merge_pem_bundles, verify_chain
 from app.planner import (
+    FAIL,
     NEW,
     OLD,
+    PASS,
+    PENDING,
     TRANSITION,
     Planner,
     build_planner,
@@ -17,8 +21,8 @@ from app.planner import (
 from scripts.generate_samples import REPLICA_DOMAINS
 
 
-def _planner(rows, limit: int) -> Planner:
-    return build_planner(rows["replicas"], rows["batches"], limit)
+def _planner(rows, limit: int, verify_budget: int | None = None) -> Planner:
+    return build_planner(rows["replicas"], rows["batches"], limit, verify_budget)
 
 
 def test_samples_generated_with_expected_structure(sample_data):
@@ -195,3 +199,201 @@ def test_matrix_covers_six_combinations(rows):
 
 def test_domains_match_sample():
     assert [d for _, d in REPLICA_DOMAINS][:1] == ["svc-a.internal.example"]
+
+
+# --------------------------------------------------------------------------- #
+# OpenSSL 调用上限（预算模式）
+# --------------------------------------------------------------------------- #
+def test_unlimited_mode_verifies_every_cell_once(rows):
+    planner = _planner(rows, limit=len(rows["batches"]))
+    result = planner.solve()
+    n, m = len(rows["replicas"]), len(rows["batches"])
+    distinct_cells = n * m * 2 * 3
+    assert result.status == "plan"
+    # 每个核验格最多调用一次 openssl，缓存条目数 == 实际调用次数
+    assert result.verify_calls == len(planner._cache) == distinct_cells
+    assert result.pending_cells == 0
+    assert result.verify_budget is None
+    assert result.shortest_confirmed is True
+
+
+def test_budget_never_exceeded_and_cells_verified_at_most_once(rows):
+    planner = _planner(rows, limit=3, verify_budget=12)
+    result = planner.solve()
+    assert result.verify_calls <= 12
+    assert result.verify_calls == len(planner._cache)
+    # 未验格不入缓存，矩阵中以 pending 呈现
+    assert result.pending_cells > 0
+    for row in result.matrix:
+        for cells in row:
+            for cell in cells.values():
+                assert cell["state"] in {PASS, FAIL, PENDING}
+
+
+def test_budget_exhausted_in_initial_check_is_pending(rows):
+    # 现状核验需要 n*m=9 次调用，预算 4 时现状阶段即用尽
+    planner = _planner(rows, limit=3, verify_budget=4)
+    result = planner.solve()
+    assert result.status == "pending"
+    assert result.verify_calls == 4
+    assert result.shortest_confirmed is False
+    assert result.plan == []
+    assert result.pending_cells > 0
+
+
+def test_plan_unconfirmed_lists_verified_plan_with_tbd_shortest(rows):
+    # 实测：48 次调用恰好能在 BFS 中走到目标，但仍有 6 个未验格
+    planner = _planner(rows, limit=3, verify_budget=48)
+    result = planner.solve()
+    assert result.status == "plan_unconfirmed"
+    assert result.steps_count > 0
+    assert result.shortest_confirmed is False
+    # 列出的方案每一步都必须通过核验（未验格不得出现在方案状态里）
+    for step in result.plan:
+        assert step["checks_passed"] == step["checks_total"]
+    assert result.pending_cells > 0
+    # 放开预算后得到同样长度且确认最短的方案
+    full = _planner(copy.deepcopy(rows), limit=3).solve()
+    assert full.status == "plan"
+    assert full.steps_count == result.steps_count
+
+
+def test_budget_growth_eventually_confirms_plan(rows):
+    # 预算逐步加大：pending → plan_unconfirmed → plan
+    statuses = []
+    for budget in (40, 48, 54):
+        r = _planner(copy.deepcopy(rows), limit=3, verify_budget=budget).solve()
+        statuses.append(r.status)
+    assert statuses[0] == "pending"
+    assert statuses[1] == "plan_unconfirmed"
+    assert statuses[2] == "plan"
+    final = _planner(rows, limit=3, verify_budget=54).solve()
+    assert final.pending_cells == 0 and final.shortest_confirmed is True
+
+
+def test_insufficient_quota_confirmed_within_budget(rows):
+    # L=0 场景实测 50 次调用即可确认最小名额 3（仍有未验格但不影响结论）
+    result = _planner(rows, limit=0, verify_budget=50).solve()
+    assert result.status == "insufficient_quota"
+    assert result.min_required == 3
+    assert result.shortest_confirmed is True
+    assert result.verify_calls <= 50
+    # 调大过渡名额后同预算下可求出方案
+    ok = _planner(copy.deepcopy(rows), limit=3, verify_budget=50).solve()
+    assert ok.status in {"plan", "plan_unconfirmed"}
+
+
+def test_pending_response_when_budget_runs_out_before_conclusion(rows):
+    # 预算 30：所有需要的核验格未验完，无法形成确定结论，整体判待定
+    result = _planner(rows, limit=0, verify_budget=30).solve()
+    assert result.status == "pending"
+    assert result.shortest_confirmed is False
+    assert result.pending_cells > 0
+    assert result.verify_calls == 30
+
+
+def test_min_limit_returns_unconfirmed_lower_bound_under_budget(rows):
+    # 直接驱动二分：预算在二分中途耗尽时返回已核验下界且 confirmed=False；
+    # 放开预算后同一求解器可补验并收敛到精确最小值
+    planner = _planner(rows, limit=0, verify_budget=53)
+    planner._violations(OLD, OLD)
+    planner._violations(NEW, NEW)
+    path, _ = planner._bfs(0)
+    assert path is None  # L=0 走不通
+    relaxed, _ = planner._bfs(planner.m)
+    assert relaxed is not None  # 放开名额可解
+    lower, confirmed = planner._min_limit()
+    assert 1 <= lower <= planner.m
+    # 预算太紧导致二分钟途出现未知：下界可信、精确值待确认
+    if not confirmed:
+        assert planner.verify_calls <= 53
+    # 放开预算重跑（未验格不入缓存，可继续补验）
+    planner.verify_budget = None
+    exact, exact_confirmed = planner._min_limit()
+    assert exact_confirmed is True
+    assert exact >= lower
+    assert exact == 3
+
+
+def test_min_limit_pending_branch_keeps_sound_lower_bound(rows):
+    # 用桩核验格确定性地构造“二分第二轮遇未验格”：
+    # 第 1 次 BFS 仅目标态格确认失败（走不通，下界上调，现状格仍通过）；
+    # 第 2 次 BFS 起始格即未验 -> 立即返回 (下界, False)，
+    # 未验证的名额不得计入下界。
+    # 批次数扩到 4，保证二分至少迭代两轮（m=3 时一轮即收敛）。
+    rows["batches"] = copy.deepcopy(rows["batches"]) + [copy.deepcopy(rows["batches"][0])]
+    planner = _planner(rows, limit=0, verify_budget=100)
+    assert planner.m == 4
+    state = {"bfs_call": 0}
+
+    def fake_cell(i, chain_state, j, bundle_mode):
+        if state["bfs_call"] == 1:
+            if chain_state == NEW and bundle_mode == NEW:
+                return CellResultStub(False, "确认失败", FAIL)
+            return CellResultStub(True, "", PASS)
+        return CellResultStub(False, "未验", PENDING)
+
+    real_bfs = planner._bfs
+
+    def counting_bfs(limit):
+        state["bfs_call"] += 1
+        return real_bfs(limit)
+
+    planner._cell = fake_cell  # type: ignore[method-assign]
+    planner._bfs = counting_bfs  # type: ignore[method-assign]
+    lower, confirmed = planner._min_limit()
+    assert confirmed is False
+    assert state["bfs_call"] == 2  # 一轮确认失败、一轮遇未验即停
+    # m=4 首个 mid=2 确认失败，下界升为 3；下一轮遇未验，3 仍是稳妥下界
+    assert lower == 3
+
+
+class CellResultStub:
+    def __init__(self, ok, reason, state):
+        self.ok = ok
+        self.reason = reason
+        self.state = state
+
+
+def test_hard_infeasible_stops_before_matrix_full_verification(rows):
+    # 新根包错放成旧根：目标态首个失败格验完即判硬无解并提前停验，
+    # 矩阵其余格子保持未验，不会为凑满矩阵而继续调用 openssl
+    healthy_rows = copy.deepcopy(rows)
+    for batch in rows["batches"]:
+        batch["new_bundle"] = batch["old_bundle"]
+    budgeted = _planner(rows, limit=3, verify_budget=20).solve()
+    assert budgeted.status == "hard_infeasible"
+    assert budgeted.verify_calls <= 20
+    assert budgeted.target_violations
+    assert budgeted.pending_cells > 0  # 未为诊断补验整矩阵
+    # 阻塞明细只包含已验失败格，未验格不混入
+    for blocker in budgeted.blocker_pairs:
+        assert blocker["failed_cells"]
+    # 对照：健康材料同预算下不会误判硬无解
+    healthy = _planner(healthy_rows, limit=3, verify_budget=54).solve()
+    assert healthy.status == "plan"
+
+
+def test_pending_cell_not_cached_and_reverify_works(rows):
+    planner = _planner(rows, limit=3, verify_budget=1)
+    result = planner.solve()
+    assert result.verify_calls == 1
+    # 未验格不写入缓存：缓存只记录真实调用过的格子
+    assert len(planner._cache) == 1
+    # 放开预算重新求解后所有格子都能补验
+    planner.verify_budget = None
+    full = planner.solve()
+    n, m = len(rows["replicas"]), len(rows["batches"])
+    assert full.status == "plan"
+    assert len(planner._cache) == n * m * 2 * 3
+
+
+def test_invalid_budget_rejected(rows):
+    with pytest.raises(ValueError):
+        build_planner(rows["replicas"], rows["batches"], 2, 0)
+    with pytest.raises(ValueError):
+        build_planner(rows["replicas"], rows["batches"], 2, -3)
+    with pytest.raises(ValueError):
+        build_planner(rows["replicas"], rows["batches"], 2, True)
+    # None 表示不启用，合法
+    assert build_planner(rows["replicas"], rows["batches"], 2, None) is not None
